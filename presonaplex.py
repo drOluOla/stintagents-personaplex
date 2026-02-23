@@ -33,6 +33,9 @@ from livekit.agents.types import NOT_GIVEN as _NOT_GIVEN
 from pydantic import BaseModel, Field
 
 
+# The PersonaPlex/Moshi server recv_loop only processes kind=0x01 (user audio).
+# All other client→server message kinds are logged as "unknown" and discarded.
+# Control messages are kept here only for the legacy text_roundtrip path.
 CONTROL_MESSAGES_MAP = {
 	"start": 0,
 	"endTurn": 1,
@@ -346,6 +349,8 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 
 		# Outgoing Opus packets queued by push_audio; None = sentinel to stop
 		self._out_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+		# Event set whenever a packet is enqueued so _send_loop wakes immediately
+		self._out_event: asyncio.Event = asyncio.Event()
 
 		# LiveKit pipeline consumes these channels for audio/text output
 		self._audio_ch: _lk_utils.aio.Chan | None = None
@@ -381,9 +386,13 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 		if self._closed:
 			return
 		try:
+			enqueued = False
 			for opus_bytes in self._encode_frame(frame):
 				if opus_bytes:
 					self._out_queue.put_nowait(opus_bytes)
+					enqueued = True
+			if enqueued:
+				self._out_event.set()  # wake _send_loop immediately
 		except Exception:
 			logger.exception("push_audio: error encoding frame sr=%d ch=%d samples=%d",
 							frame.sample_rate, frame.num_channels, frame.samples_per_channel)
@@ -418,9 +427,22 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 				self._out_queue.get_nowait()
 			except asyncio.QueueEmpty:
 				break
+		self._out_event.clear()
 
 	def interrupt(self) -> None:
-		pass
+		"""Swap audio channels and re-announce the generation.
+
+		PersonaPlex keeps streaming audio from the server regardless — it hears
+		the user and naturally lowers its output.  What we must do on the client
+		side is give the LiveKit pipeline a fresh GenerationCreatedEvent so it
+		immediately re-subscribes to model audio.  Without this the pipeline enters
+		an idle state and stops forwarding frames to the speaker even though
+		_recv_loop is still writing them, causing the "no interruption / delayed
+		response" symptom.
+		"""
+		logger.debug("interrupt() — re-subscribing pipeline to model audio stream")
+		evt = self._make_generation_event(user_initiated=False)
+		self.emit("generation_created", evt)
 
 	def truncate(
 		self, *, message_id, modalities, audio_end_ms, audio_transcript=_NOT_GIVEN
@@ -429,7 +451,8 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 
 	async def aclose(self) -> None:
 		self._closed = True
-		await self._out_queue.put(None)  # unblock send loop
+		await self._out_queue.put(None)  # sentinel to stop send loop
+		self._out_event.set()           # wake _send_loop so it sees the sentinel
 		if self._audio_ch and not self._audio_ch.closed:
 			self._audio_ch.close()
 		if self._text_ch and not self._text_ch.closed:
@@ -605,9 +628,10 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 				self.emit("generation_created", evt)
 
 				send_t = asyncio.create_task(self._send_loop(ws))
+				flush_t = asyncio.create_task(self._flush_loop(ws))
 				recv_t = asyncio.create_task(self._recv_loop(ws))
 				done, pending = await asyncio.wait(
-					[send_t, recv_t], return_when=asyncio.FIRST_COMPLETED
+					[send_t, flush_t, recv_t], return_when=asyncio.FIRST_COMPLETED
 				)
 				for t in pending:
 					t.cancel()
@@ -635,22 +659,57 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 				self._text_ch.close()
 
 	async def _send_loop(self, ws) -> None:
-		"""Drain the output queue and forward Opus packets to PersonaPlex."""
+		"""Drain the output queue and forward Opus packets to PersonaPlex.
+
+		 Uses an asyncio.Event so the coroutine wakes the moment push_audio
+		 enqueues a packet, eliminating the previous 50 ms polling timeout.
+		 After waking, all queued packets are drained in a single pass to avoid
+		 head-of-line blocking when multiple frames have accumulated.
+		"""
 		sent = 0
 		while not self._closed:
-			try:
-				opus = await asyncio.wait_for(self._out_queue.get(), timeout=0.05)
-			except asyncio.TimeoutError:
-				continue
-			if opus is None:  # sentinel from aclose()
-				break
-			await ws.send(b"\x01" + opus)
-			sent += 1
-			if sent == 1:
-				logger.info("PersonaPlex: first audio packet sent to server (%d bytes)", len(opus))
-			elif sent % 500 == 0:
-				logger.debug("PersonaPlex: %d audio packets sent to server", sent)
+			# Wait until at least one packet is available (or sentinel)
+			await self._out_event.wait()
+			self._out_event.clear()
+			# Drain everything that is currently queued
+			while True:
+				try:
+					opus = self._out_queue.get_nowait()
+				except asyncio.QueueEmpty:
+					break
+				if opus is None:  # sentinel from aclose()
+					logger.info("PersonaPlex _send_loop exited (sent %d packets)", sent)
+					return
+				await ws.send(b"\x01" + opus)
+				sent += 1
+				if sent == 1:
+					logger.info("PersonaPlex: first audio packet sent to server (%d bytes)", len(opus))
+				elif sent % 500 == 0:
+					logger.debug("PersonaPlex: %d audio packets sent to server", sent)
 		logger.info("PersonaPlex _send_loop exited (sent %d packets)", sent)
+
+	async def _flush_loop(self, ws) -> None:
+		"""Periodically flush any bytes buffered inside sphn.OpusStreamWriter.
+
+		 sphn produces Ogg/Opus pages which may span several 20 ms Opus frames
+		 before a page boundary is reached.  Without this loop those bytes sit
+		 inside the writer until the next append_pcm() call — potentially adding
+		 60-80 ms of extra latency on top of the model's own 80 ms frame rate.
+		 Polling at 10 ms (half an Opus frame) keeps worst-case buffering ≤ 10 ms.
+		"""
+		while not self._closed:
+			await asyncio.sleep(0.01)  # 10 ms — well below one Opus frame (20 ms)
+			if self._writer is None:
+				continue
+			try:
+				chunk = self._writer.read_bytes()
+			except Exception:
+				continue
+			if chunk:
+				try:
+					await ws.send(b"\x01" + chunk)
+				except Exception:
+					break
 
 	async def _recv_loop(self, ws) -> None:
 		"""Receive Opus audio and text tokens from PersonaPlex and forward to LiveKit."""
@@ -759,6 +818,20 @@ async def livekit_entrypoint(ctx: _JobContext) -> None:
 			voice_prompt=os.getenv("PERSONAPLEX_VOICE_PROMPT", _LK_DEFAULT_VOICE_PROMPT),
 			seed=int(os.getenv("PERSONAPLEX_SEED", "-1")),
 		),
+		# PersonaPlex is a continuous full-duplex model: user audio must flow to
+		# the server AT ALL TIMES, not just during detected speech windows.
+		# Disabling the discard-if-uninterruptible flag ensures push_audio is
+		# called unconditionally so the server hears the user continuously.
+		discard_audio_if_uninterruptible=False,
+		# Remove the default 500ms end-of-speech silence gate.  PersonaPlex
+		# generates audio the instant it has something to say; there is no
+		# need to wait for a VAD-confirmed turn boundary before re-subscribing
+		# to the model audio channel.
+		min_endpointing_delay=0.0,
+		max_endpointing_delay=0.5,
+		# Allow interruptions with the shortest detectable speech burst so the
+		# pipeline stops gating audio early rather than waiting for a full word.
+		min_interruption_duration=0.05,
 	)
 	await session.start(
 		agent=_Agent(
