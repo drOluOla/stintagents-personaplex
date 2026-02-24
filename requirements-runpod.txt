@@ -9,4 +9,3 @@ pydantic>=2.7.0
 python-dotenv>=1.0.0
 runpod>=1.7.0
 opuslib>=3.0.1
-av>=16.0.0

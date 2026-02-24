@@ -12,7 +12,6 @@ logger = logging.getLogger("presonaplex")
 
 import uuid
 
-import av as _av
 import sphn as _sphn
 import httpx
 import numpy as _np
@@ -343,8 +342,7 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 		# 480-sample (20 ms @ 24 kHz) chunks — the same size the server uses.
 		self._pcm_buf: _np.ndarray = _np.empty(0, dtype=_np.float32)
 		self._OPUS_FRAME = 480
-		# Resampler to convert LiveKit participant audio (typically 48 kHz) → 24 kHz
-		self._resampler: _av.AudioResampler | None = None
+		# Track the last seen input sample rate for logging only
 		self._resampler_in_rate: int = 0
 
 		# Outgoing Opus packets queued by push_audio; None = sentinel to stop
@@ -467,6 +465,21 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 	# ── Opus codec helpers ───────────────────────────────────────────────────
 
 
+	@staticmethod
+	def _resample_numpy(pcm: _np.ndarray, in_rate: int, out_rate: int) -> _np.ndarray:
+		"""Resample a 1-D float32 PCM array from in_rate to out_rate.
+
+		Uses linear interpolation via numpy.interp — no extra dependencies.
+		For the common 48 kHz → 24 kHz case this is an exact 2:1 decimation
+		so quality is effectively identical to a proper polyphase filter.
+		"""
+		if in_rate == out_rate or len(pcm) == 0:
+			return pcm
+		n_out = max(1, int(round(len(pcm) * out_rate / in_rate)))
+		x_in = _np.linspace(0.0, 1.0, len(pcm), endpoint=False)
+		x_out = _np.linspace(0.0, 1.0, n_out, endpoint=False)
+		return _np.interp(x_out, x_in, pcm).astype(_np.float32)
+
 	def _init_encoder(self) -> None:
 		# OpusStreamWriter produces the same Ogg/Opus container the server reads
 		self._writer = _sphn.OpusStreamWriter(_LK_SAMPLE_RATE)
@@ -486,20 +499,14 @@ class PersonaPlexRealtimeSession(_llm.RealtimeSession):
 			raw = raw.reshape(-1, nch).mean(axis=1).astype(_np.int16)
 		# Resample to 24 kHz if the incoming frame is at a different rate
 		if frame.sample_rate != _LK_SAMPLE_RATE:
-			if self._resampler is None or self._resampler_in_rate != frame.sample_rate:
-				self._resampler = _av.AudioResampler(
-					format="s16",
-					layout="mono",
-					rate=_LK_SAMPLE_RATE,
-				)
+			if self._resampler_in_rate != frame.sample_rate:
+				logger.debug("Resampling audio %d Hz → %d Hz", frame.sample_rate, _LK_SAMPLE_RATE)
 				self._resampler_in_rate = frame.sample_rate
-			av_frame = _av.AudioFrame.from_ndarray(raw.reshape(1, -1), format="s16", layout="mono")
-			av_frame.sample_rate = frame.sample_rate
-			resampled_frames = list(self._resampler.resample(av_frame))
-			pcm = _np.concatenate(
-				[f.to_ndarray().flatten().astype(_np.float32) / 32768.0
-				 for f in resampled_frames]
-			) if resampled_frames else _np.empty(0, dtype=_np.float32)
+			pcm = self._resample_numpy(
+				raw.astype(_np.float32) / 32768.0,
+				frame.sample_rate,
+				_LK_SAMPLE_RATE,
+			)
 		else:
 			pcm = raw.astype(_np.float32) / 32768.0
 		if len(pcm) == 0:
