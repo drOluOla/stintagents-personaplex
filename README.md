@@ -1,5 +1,6 @@
-# PersonaPlex on RunPod — full-duplex realtime bridge
+# PersonaPlex on RunPod
 
+A simple demonstation of how personaplex can be hosted to serve voices/audio for future StintAgents implementation.
 This setup runs the PersonaPlex speech-to-speech model on a RunPod GPU pod and connects it to LiveKit as a native realtime model, with an optional HTTP endpoint for one-shot text requests.
 
 - Downloads and loads `nvidia/personaplex-7b-v1` weights from Hugging Face on RunPod
