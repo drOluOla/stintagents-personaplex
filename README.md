@@ -1,6 +1,5 @@
 # PersonaPlex on RunPod
 
-A simple demonstation of how personaplex can be hosted to serve voices/audio for future StintAgents implementation.
 This setup runs the PersonaPlex speech-to-speech model on a RunPod GPU pod and connects it to LiveKit as a native realtime model, with an optional HTTP endpoint for one-shot text requests.
 
 - Downloads and loads `nvidia/personaplex-7b-v1` weights from Hugging Face on RunPod
@@ -14,6 +13,8 @@ This setup runs the PersonaPlex speech-to-speech model on a RunPod GPU pod and c
 - `Dockerfile.runpod`: Container image for RunPod
 - `runpod_start.sh`: Starts the PersonaPlex model server (`moshi.server`) and the HTTP bridge
 - `runpod_serverless.py`: Optional RunPod serverless entrypoint
+- `requirements.txt`: Dependencies for running the **LiveKit agent locally** (includes `livekit-agents`, `av`, `numpy`, etc.)
+- `requirements-runpod.txt`: Dependencies installed **inside the RunPod Docker image** (`fastapi`, `uvicorn`, `websockets`, `av`, `opuslib`, `runpod`, etc.) — does not include LiveKit agent packages
 
 ## 1) Prepare Hugging Face access
 

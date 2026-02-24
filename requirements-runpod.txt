@@ -1,6 +1,5 @@
 # Dependencies for the RunPod GPU pod only.
 # The pod runs: moshi.server (PersonaPlex WS) + presonaplex.py serve-http (HTTP bridge)
-# It does NOT run the LiveKit agent, so livekit-agents / av / numpy are excluded.
 
 fastapi>=0.115.0
 uvicorn>=0.30.0
@@ -10,3 +9,4 @@ pydantic>=2.7.0
 python-dotenv>=1.0.0
 runpod>=1.7.0
 opuslib>=3.0.1
+av>=16.0.0
